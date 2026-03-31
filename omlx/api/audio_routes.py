@@ -186,6 +186,8 @@ async def create_speech(request: AudioSpeechRequest):
             voice=request.voice,
             speed=request.speed,
             instructions=request.instructions,
+            ref_audio=request.ref_audio,
+            ref_text=request.ref_text,
         )
     except HTTPException:
         raise

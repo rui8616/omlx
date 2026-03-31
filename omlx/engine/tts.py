@@ -23,6 +23,10 @@ from .base import BaseNonStreamingEngine
 
 logger = logging.getLogger(__name__)
 
+# Maximum reference audio duration (seconds) for voice cloning.
+# Longer audio overwhelms the ICL context and produces noise.
+_MAX_REF_AUDIO_SECS = 15
+
 
 class TTSEngine(BaseNonStreamingEngine):
     """
@@ -117,6 +121,8 @@ class TTSEngine(BaseNonStreamingEngine):
         voice: Optional[str] = None,
         speed: float = 1.0,
         instructions: Optional[str] = None,
+        ref_audio: Optional[str] = None,
+        ref_text: Optional[str] = None,
         **kwargs,
     ) -> bytes:
         """
@@ -127,6 +133,10 @@ class TTSEngine(BaseNonStreamingEngine):
             voice: Optional voice/speaker identifier
             speed: Speech speed multiplier (1.0 = normal)
             instructions: Optional voice description for instruct-capable models
+            ref_audio: Optional base64 data URI or URL of reference audio for
+                voice cloning (requires a model whose ``generate()`` accepts
+                ``ref_audio``, e.g. Qwen3-TTS Base)
+            ref_text: Optional transcript of the reference audio
             **kwargs: Additional model-specific parameters
 
         Returns:
@@ -138,12 +148,20 @@ class TTSEngine(BaseNonStreamingEngine):
         import time
 
         logger.info(
-            "TTS synthesize: model=%s, text_len=%d, voice=%s, speed=%.1f",
+            "TTS synthesize: model=%s, text_len=%d, voice=%s, speed=%.1f, "
+            "voice_clone=%s",
             self._model_name, len(text), voice, speed,
+            bool(ref_audio),
         )
 
         model = self._model
         t0 = time.monotonic()
+
+        # Decode reference audio to a temp file when voice-cloning.
+        ref_audio_path: Optional[str] = None
+        if ref_audio is not None:
+            ref_audio_path = self._decode_ref_audio(ref_audio)
+            ref_audio_path = self._truncate_ref_audio(ref_audio_path)
 
         def _synthesize_sync():
             # model.generate() returns an iterable of results,
@@ -167,22 +185,47 @@ class TTSEngine(BaseNonStreamingEngine):
                 gen_kwargs["instruct"] = instructions
             if speed != 1.0:
                 gen_kwargs["speed"] = speed
+
+            # Voice-clone: pass ref_audio/ref_text to generate() if supported.
+            if ref_audio_path is not None:
+                if "ref_audio" not in gen_params:
+                    raise RuntimeError(
+                        f"Model '{self._model_name}' does not support voice "
+                        "cloning (generate() has no ref_audio parameter)"
+                    )
+                gen_kwargs["ref_audio"] = ref_audio_path
+                gen_kwargs["ref_text"] = ref_text or ""
+
             gen_kwargs.update(kwargs)
 
-            results = model.generate(**gen_kwargs)
-            audio_chunks = []
-            sample_rate = _DEFAULT_SAMPLE_RATE
+            log_kw = {k: (v if k != "ref_audio" else f"<path:{v}>")
+                       for k, v in gen_kwargs.items()}
+            logger.info("TTS generate() kwargs: %s", log_kw)
 
-            for result in results:
-                audio_chunks.append(np.array(result.audio))
-                if hasattr(result, "sample_rate"):
-                    sample_rate = result.sample_rate
+            try:
+                results = model.generate(**gen_kwargs)
+                audio_chunks = []
+                sample_rate = _DEFAULT_SAMPLE_RATE
 
-            if not audio_chunks:
-                raise RuntimeError("TTS model produced no audio output")
+                for result in results:
+                    audio_chunks.append(np.array(result.audio))
+                    if hasattr(result, "sample_rate"):
+                        sample_rate = result.sample_rate
 
-            audio = np.concatenate(audio_chunks, axis=0)
-            return _audio_to_wav_bytes(audio, int(sample_rate))
+                if not audio_chunks:
+                    raise RuntimeError("TTS model produced no audio output")
+
+                audio = np.concatenate(audio_chunks, axis=0)
+                logger.info(
+                    "TTS audio result: chunks=%d, samples=%d, sr=%d, "
+                    "dtype=%s, min=%.4f, max=%.4f",
+                    len(audio_chunks), len(audio), sample_rate,
+                    audio.dtype, float(audio.min()), float(audio.max()),
+                )
+                return _audio_to_wav_bytes(audio, int(sample_rate))
+            finally:
+                if ref_audio_path is not None:
+                    self._cleanup_ref_audio(ref_audio_path)
 
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(
@@ -190,11 +233,126 @@ class TTSEngine(BaseNonStreamingEngine):
         )
 
         elapsed = time.monotonic() - t0
+        mode = "voice-clone" if ref_audio_path else "synthesize"
         logger.info(
-            "TTS synthesize done: model=%s, %.2fs, %d bytes output",
-            self._model_name, elapsed, len(result),
+            "TTS %s done: model=%s, %.2fs, %d bytes output",
+            mode, self._model_name, elapsed, len(result),
         )
         return result
+
+    # ------------------------------------------------------------------
+    # Voice-clone helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _decode_ref_audio(ref_audio: str) -> str:
+        """Decode a base64 data URI or URL to a temporary WAV file path.
+
+        Supported formats:
+        - ``data:audio/...;base64,<data>`` (data URI)
+        - Raw base64 string (no ``data:`` prefix)
+        - ``http://`` / ``https://`` URL (downloaded to a temp file)
+
+        Returns:
+            Absolute path to a temporary WAV file.  The caller is
+            responsible for cleaning up via :meth:`_cleanup_ref_audio`.
+        """
+        import base64
+        import tempfile
+        import urllib.request
+
+        if ref_audio.startswith(("http://", "https://")):
+            tmp = tempfile.NamedTemporaryFile(
+                delete=False, suffix=".wav", prefix="omlx_ref_"
+            )
+            try:
+                urllib.request.urlretrieve(ref_audio, tmp.name)
+            except Exception:
+                import os
+                os.unlink(tmp.name)
+                raise
+            return tmp.name
+
+        # Strip data-URI header if present
+        data = ref_audio
+        if data.startswith("data:"):
+            # data:audio/wav;base64,<payload>
+            _, _, data = data.partition(",")
+
+        raw = base64.b64decode(data)
+        tmp = tempfile.NamedTemporaryFile(
+            delete=False, suffix=".wav", prefix="omlx_ref_"
+        )
+        tmp.write(raw)
+        tmp.close()
+        return tmp.name
+
+    @staticmethod
+    def _truncate_ref_audio(path: str) -> str:
+        """Truncate reference audio to ``_MAX_REF_AUDIO_SECS`` if needed.
+
+        Long reference audio overwhelms the ICL voice-clone context and
+        produces noise.  This reads the WAV, checks duration, and rewrites
+        a truncated copy if it exceeds the limit.
+
+        Returns:
+            The original *path* (unchanged) or a new truncated temp path.
+        """
+        import os
+        import tempfile
+        import wave
+
+        try:
+            with wave.open(path, "rb") as wf:
+                sr = wf.getframerate()
+                n_frames = wf.getnframes()
+                duration = n_frames / sr
+                logger.info(
+                    "Voice-clone ref_audio: %s, %.1fs, %dHz, %dch, %d bytes",
+                    path, duration, sr, wf.getnchannels(),
+                    os.path.getsize(path),
+                )
+                if duration <= _MAX_REF_AUDIO_SECS:
+                    return path
+                # Truncate: keep the first _MAX_REF_AUDIO_SECS
+                max_frames = int(sr * _MAX_REF_AUDIO_SECS)
+                wf.rewind()
+                frames = wf.readframes(max_frames)
+                params = wf.getparams()
+        except wave.Error:
+            # Not a valid WAV (could be mp3/ogg/etc.) — let the model
+            # handle it; load_audio supports more formats via soundfile.
+            logger.info(
+                "Voice-clone ref_audio: %s, non-WAV format, %d bytes",
+                path, os.path.getsize(path),
+            )
+            return path
+
+        logger.info(
+            "Voice-clone ref_audio truncated: %.1fs -> %.1fs",
+            duration, _MAX_REF_AUDIO_SECS,
+        )
+        tmp = tempfile.NamedTemporaryFile(
+            delete=False, suffix=".wav", prefix="omlx_ref_"
+        )
+        with wave.open(tmp, "wb") as wf_out:
+            wf_out.setparams(params._replace(nframes=max_frames))
+            wf_out.writeframes(frames)
+        # Remove the original oversized temp file
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        return tmp.name
+
+    @staticmethod
+    def _cleanup_ref_audio(path: str) -> None:
+        """Remove a temporary reference-audio file (best-effort)."""
+        import os
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
 
     def get_stats(self) -> Dict[str, Any]:
         """Get engine statistics."""
