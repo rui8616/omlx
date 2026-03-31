@@ -334,6 +334,223 @@ class TestTTSVoiceRouting:
 
 
 # ---------------------------------------------------------------------------
+# TestTTSVoiceClone — unit tests for voice-clone (ref_audio) path
+# ---------------------------------------------------------------------------
+
+
+class TestTTSVoiceClone:
+    """Verify the voice-clone code path in TTSEngine.synthesize()."""
+
+    @pytest.fixture
+    def _ref_audio_b64(self):
+        """Return a base64 data URI containing a minimal valid WAV."""
+        import base64
+        wav = _make_wav_bytes(duration_secs=0.05)
+        return "data:audio/wav;base64," + base64.b64encode(wav).decode()
+
+    @pytest.fixture
+    def _make_clone_engine(self):
+        """Build a TTSEngine whose model has generate_voice_clone."""
+        import asyncio
+        from omlx.engine.tts import TTSEngine
+
+        def _build(clone_returns_audio=True):
+            engine = TTSEngine("test-clone-model")
+            mock_model = MagicMock()
+
+            if clone_returns_audio:
+                import numpy as np
+                chunk = MagicMock()
+                chunk.audio = np.zeros(1000, dtype=np.float32)
+                chunk.sample_rate = 22050
+                mock_model.generate_voice_clone = MagicMock(return_value=[chunk])
+            else:
+                mock_model.generate_voice_clone = MagicMock(return_value=[])
+
+            # Also give it generate() for the non-clone path
+            mock_model.generate = MagicMock(return_value=[])
+            engine._model = mock_model
+            return engine
+
+        return _build
+
+    def test_voice_clone_calls_generate_voice_clone(
+        self, _make_clone_engine, _ref_audio_b64
+    ):
+        """When ref_audio is provided, generate_voice_clone is called."""
+        import asyncio
+        engine = _make_clone_engine()
+        asyncio.run(engine.synthesize(
+            "Hello", ref_audio=_ref_audio_b64, ref_text="hello",
+        ))
+        engine._model.generate_voice_clone.assert_called_once()
+        engine._model.generate.assert_not_called()
+
+    def test_voice_clone_passes_ref_text(
+        self, _make_clone_engine, _ref_audio_b64
+    ):
+        """ref_text is forwarded to generate_voice_clone."""
+        import asyncio
+        engine = _make_clone_engine()
+        asyncio.run(engine.synthesize(
+            "Hi", ref_audio=_ref_audio_b64, ref_text="reference text",
+        ))
+        call_kwargs = engine._model.generate_voice_clone.call_args.kwargs
+        assert call_kwargs["ref_text"] == "reference text"
+
+    def test_voice_clone_returns_wav(
+        self, _make_clone_engine, _ref_audio_b64
+    ):
+        """Voice-clone path returns valid WAV bytes."""
+        import asyncio
+        engine = _make_clone_engine()
+        result = asyncio.run(engine.synthesize(
+            "Test", ref_audio=_ref_audio_b64, ref_text="test",
+        ))
+        assert isinstance(result, bytes)
+        assert result[:4] == RIFF_MAGIC
+
+    def test_voice_clone_no_audio_raises(
+        self, _make_clone_engine, _ref_audio_b64
+    ):
+        """Voice-clone with empty model output raises RuntimeError."""
+        import asyncio
+        engine = _make_clone_engine(clone_returns_audio=False)
+        with pytest.raises(RuntimeError, match="no audio"):
+            asyncio.run(engine.synthesize(
+                "Fail", ref_audio=_ref_audio_b64, ref_text="fail",
+            ))
+
+    def test_voice_clone_missing_method_raises(self, _ref_audio_b64):
+        """Model without generate_voice_clone raises RuntimeError."""
+        import asyncio
+        from omlx.engine.tts import TTSEngine
+        engine = TTSEngine("no-clone-model")
+        mock_model = MagicMock(spec=[])  # no attributes
+        engine._model = mock_model
+        with pytest.raises(RuntimeError, match="does not support voice cloning"):
+            asyncio.run(engine.synthesize(
+                "Fail", ref_audio=_ref_audio_b64,
+            ))
+
+    def test_without_ref_audio_uses_generate(self, _make_clone_engine):
+        """Without ref_audio, the standard generate() path is used."""
+        import asyncio
+        import numpy as np
+        engine = _make_clone_engine()
+        # Make generate() return audio so it doesn't raise
+        chunk = MagicMock()
+        chunk.audio = np.zeros(1000, dtype=np.float32)
+        chunk.sample_rate = 22050
+        engine._model.generate.return_value = [chunk]
+        import inspect
+        engine._model.generate.__signature__ = inspect.Signature(
+            parameters=[
+                inspect.Parameter("text", inspect.Parameter.POSITIONAL_OR_KEYWORD),
+                inspect.Parameter("verbose", inspect.Parameter.POSITIONAL_OR_KEYWORD, default=False),
+            ]
+        )
+        asyncio.run(engine.synthesize("Hello"))
+        engine._model.generate.assert_called_once()
+        engine._model.generate_voice_clone.assert_not_called()
+
+    def test_ref_audio_temp_file_cleaned_up(
+        self, _make_clone_engine, _ref_audio_b64
+    ):
+        """Temporary reference audio file is removed after synthesis."""
+        import asyncio
+        import os
+        engine = _make_clone_engine()
+        # Capture the ref_audio path passed to generate_voice_clone
+        captured_path = []
+        original = engine._model.generate_voice_clone
+
+        def _capture(*args, **kwargs):
+            captured_path.append(kwargs.get("ref_audio", args[2] if len(args) > 2 else None))
+            return original(*args, **kwargs)
+
+        engine._model.generate_voice_clone = _capture
+        asyncio.run(engine.synthesize(
+            "Test", ref_audio=_ref_audio_b64, ref_text="test",
+        ))
+        assert captured_path
+        assert not os.path.exists(captured_path[0])
+
+
+class TestTTSVoiceCloneEndpoint:
+    """Verify the /v1/audio/speech endpoint passes voice-clone params."""
+
+    def test_ref_audio_forwarded_to_engine(self, server_tts_client):
+        """ref_audio and ref_text are forwarded to synthesize()."""
+        import base64
+        client, mock_pool = server_tts_client
+        ref_b64 = "data:audio/wav;base64," + base64.b64encode(b"RIFF").decode()
+        response = client.post(
+            "/v1/audio/speech",
+            json={
+                "model": "qwen3-tts",
+                "input": "Hello",
+                "ref_audio": ref_b64,
+                "ref_text": "hello",
+            },
+        )
+        assert response.status_code == 200
+        synthesize: AsyncMock = mock_pool.get_engine.return_value.synthesize
+        call_kwargs = synthesize.call_args.kwargs
+        assert call_kwargs.get("ref_audio") == ref_b64
+        assert call_kwargs.get("ref_text") == "hello"
+
+    def test_no_ref_audio_still_works(self, server_tts_client):
+        """Without ref_audio, endpoint works as before."""
+        client, mock_pool = server_tts_client
+        response = client.post(
+            "/v1/audio/speech",
+            json={"model": "qwen3-tts", "input": "Hello"},
+        )
+        assert response.status_code == 200
+        synthesize: AsyncMock = mock_pool.get_engine.return_value.synthesize
+        call_kwargs = synthesize.call_args.kwargs
+        assert call_kwargs.get("ref_audio") is None
+        assert call_kwargs.get("ref_text") is None
+
+
+# ---------------------------------------------------------------------------
+# TestTTSDecodeRefAudio — unit tests for _decode_ref_audio helper
+# ---------------------------------------------------------------------------
+
+
+class TestTTSDecodeRefAudio:
+    """Verify _decode_ref_audio handles different input formats."""
+
+    def test_data_uri(self):
+        """data:audio/wav;base64,... is decoded correctly."""
+        import base64
+        import os
+        from omlx.engine.tts import TTSEngine
+        payload = b"fake-wav-content"
+        data_uri = "data:audio/wav;base64," + base64.b64encode(payload).decode()
+        path = TTSEngine._decode_ref_audio(data_uri)
+        try:
+            with open(path, "rb") as f:
+                assert f.read() == payload
+        finally:
+            os.unlink(path)
+
+    def test_raw_base64(self):
+        """Raw base64 string (no data: prefix) is decoded correctly."""
+        import base64
+        import os
+        from omlx.engine.tts import TTSEngine
+        payload = b"raw-audio-bytes"
+        path = TTSEngine._decode_ref_audio(base64.b64encode(payload).decode())
+        try:
+            with open(path, "rb") as f:
+                assert f.read() == payload
+        finally:
+            os.unlink(path)
+
+
+# ---------------------------------------------------------------------------
 # Integration test (slow, requires mlx-audio)
 # ---------------------------------------------------------------------------
 

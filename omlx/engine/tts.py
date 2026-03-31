@@ -117,6 +117,8 @@ class TTSEngine(BaseNonStreamingEngine):
         voice: Optional[str] = None,
         speed: float = 1.0,
         instructions: Optional[str] = None,
+        ref_audio: Optional[str] = None,
+        ref_text: Optional[str] = None,
         **kwargs,
     ) -> bytes:
         """
@@ -127,6 +129,10 @@ class TTSEngine(BaseNonStreamingEngine):
             voice: Optional voice/speaker identifier
             speed: Speech speed multiplier (1.0 = normal)
             instructions: Optional voice description for instruct-capable models
+            ref_audio: Optional base64 data URI or URL of reference audio for
+                voice cloning (requires a model that supports
+                ``generate_voice_clone``, e.g. Qwen3-TTS Base)
+            ref_text: Optional transcript of the reference audio
             **kwargs: Additional model-specific parameters
 
         Returns:
@@ -138,13 +144,59 @@ class TTSEngine(BaseNonStreamingEngine):
         import time
 
         logger.info(
-            "TTS synthesize: model=%s, text_len=%d, voice=%s, speed=%.1f",
+            "TTS synthesize: model=%s, text_len=%d, voice=%s, speed=%.1f, "
+            "voice_clone=%s",
             self._model_name, len(text), voice, speed,
+            bool(ref_audio),
         )
 
         model = self._model
         t0 = time.monotonic()
 
+        # --- Voice-clone path ---
+        if ref_audio is not None:
+            if not hasattr(model, "generate_voice_clone"):
+                raise RuntimeError(
+                    f"Model '{self._model_name}' does not support voice "
+                    "cloning (missing generate_voice_clone method)"
+                )
+
+            ref_audio_path = self._decode_ref_audio(ref_audio)
+
+            def _clone_sync():
+                try:
+                    results = model.generate_voice_clone(
+                        text=text,
+                        language=voice,
+                        ref_audio=ref_audio_path,
+                        ref_text=ref_text or "",
+                    )
+                    audio_chunks = []
+                    sample_rate = _DEFAULT_SAMPLE_RATE
+                    for result in results:
+                        audio_chunks.append(np.array(result.audio))
+                        if hasattr(result, "sample_rate"):
+                            sample_rate = result.sample_rate
+                    if not audio_chunks:
+                        raise RuntimeError("Voice clone produced no audio output")
+                    audio = np.concatenate(audio_chunks, axis=0)
+                    return _audio_to_wav_bytes(audio, int(sample_rate))
+                finally:
+                    self._cleanup_ref_audio(ref_audio_path)
+
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(
+                get_mlx_executor(), _clone_sync
+            )
+
+            elapsed = time.monotonic() - t0
+            logger.info(
+                "TTS voice-clone done: model=%s, %.2fs, %d bytes output",
+                self._model_name, elapsed, len(result),
+            )
+            return result
+
+        # --- Standard synthesis path ---
         def _synthesize_sync():
             # model.generate() returns an iterable of results,
             # each with .audio (array) and .sample_rate (int).
@@ -195,6 +247,62 @@ class TTSEngine(BaseNonStreamingEngine):
             self._model_name, elapsed, len(result),
         )
         return result
+
+    # ------------------------------------------------------------------
+    # Voice-clone helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _decode_ref_audio(ref_audio: str) -> str:
+        """Decode a base64 data URI or URL to a temporary WAV file path.
+
+        Supported formats:
+        - ``data:audio/...;base64,<data>`` (data URI)
+        - Raw base64 string (no ``data:`` prefix)
+        - ``http://`` / ``https://`` URL (downloaded to a temp file)
+
+        Returns:
+            Absolute path to a temporary WAV file.  The caller is
+            responsible for cleaning up via :meth:`_cleanup_ref_audio`.
+        """
+        import base64
+        import tempfile
+        import urllib.request
+
+        if ref_audio.startswith(("http://", "https://")):
+            tmp = tempfile.NamedTemporaryFile(
+                delete=False, suffix=".wav", prefix="omlx_ref_"
+            )
+            try:
+                urllib.request.urlretrieve(ref_audio, tmp.name)
+            except Exception:
+                import os
+                os.unlink(tmp.name)
+                raise
+            return tmp.name
+
+        # Strip data-URI header if present
+        data = ref_audio
+        if data.startswith("data:"):
+            # data:audio/wav;base64,<payload>
+            _, _, data = data.partition(",")
+
+        raw = base64.b64decode(data)
+        tmp = tempfile.NamedTemporaryFile(
+            delete=False, suffix=".wav", prefix="omlx_ref_"
+        )
+        tmp.write(raw)
+        tmp.close()
+        return tmp.name
+
+    @staticmethod
+    def _cleanup_ref_audio(path: str) -> None:
+        """Remove a temporary reference-audio file (best-effort)."""
+        import os
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
 
     def get_stats(self) -> Dict[str, Any]:
         """Get engine statistics."""
