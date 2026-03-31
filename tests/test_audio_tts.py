@@ -8,6 +8,7 @@ All unit tests run with mocked TTSEngine and EnginePool — mlx-audio is not
 required. Integration tests (marked @pytest.mark.slow) need a real model.
 """
 
+import inspect
 import io
 import wave
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -341,6 +342,21 @@ class TestTTSVoiceRouting:
 class TestTTSVoiceClone:
     """Verify the voice-clone code path in TTSEngine.synthesize()."""
 
+    # Signature for a generate() that supports voice cloning params
+    _CLONE_SIG = inspect.Signature(parameters=[
+        inspect.Parameter("text", inspect.Parameter.POSITIONAL_OR_KEYWORD),
+        inspect.Parameter("verbose", inspect.Parameter.POSITIONAL_OR_KEYWORD, default=False),
+        inspect.Parameter("voice", inspect.Parameter.POSITIONAL_OR_KEYWORD, default=None),
+        inspect.Parameter("ref_audio", inspect.Parameter.POSITIONAL_OR_KEYWORD, default=None),
+        inspect.Parameter("ref_text", inspect.Parameter.POSITIONAL_OR_KEYWORD, default=None),
+    ])
+
+    # Signature without voice cloning params
+    _NO_CLONE_SIG = inspect.Signature(parameters=[
+        inspect.Parameter("text", inspect.Parameter.POSITIONAL_OR_KEYWORD),
+        inspect.Parameter("verbose", inspect.Parameter.POSITIONAL_OR_KEYWORD, default=False),
+    ])
+
     @pytest.fixture
     def _ref_audio_b64(self):
         """Return a base64 data URI containing a minimal valid WAV."""
@@ -350,52 +366,53 @@ class TestTTSVoiceClone:
 
     @pytest.fixture
     def _make_clone_engine(self):
-        """Build a TTSEngine whose model has generate_voice_clone."""
+        """Build a TTSEngine whose model.generate() accepts ref_audio."""
         import asyncio
         from omlx.engine.tts import TTSEngine
 
-        def _build(clone_returns_audio=True):
+        def _build(returns_audio=True):
             engine = TTSEngine("test-clone-model")
             mock_model = MagicMock()
 
-            if clone_returns_audio:
+            if returns_audio:
                 import numpy as np
                 chunk = MagicMock()
                 chunk.audio = np.zeros(1000, dtype=np.float32)
                 chunk.sample_rate = 22050
-                mock_model.generate_voice_clone = MagicMock(return_value=[chunk])
+                mock_model.generate = MagicMock(return_value=[chunk])
             else:
-                mock_model.generate_voice_clone = MagicMock(return_value=[])
+                mock_model.generate = MagicMock(return_value=[])
 
-            # Also give it generate() for the non-clone path
-            mock_model.generate = MagicMock(return_value=[])
+            mock_model.generate.__signature__ = TestTTSVoiceClone._CLONE_SIG
             engine._model = mock_model
             return engine
 
         return _build
 
-    def test_voice_clone_calls_generate_voice_clone(
+    def test_voice_clone_calls_generate_with_ref_audio(
         self, _make_clone_engine, _ref_audio_b64
     ):
-        """When ref_audio is provided, generate_voice_clone is called."""
+        """When ref_audio is provided, generate() is called with ref_audio."""
         import asyncio
         engine = _make_clone_engine()
         asyncio.run(engine.synthesize(
             "Hello", ref_audio=_ref_audio_b64, ref_text="hello",
         ))
-        engine._model.generate_voice_clone.assert_called_once()
-        engine._model.generate.assert_not_called()
+        engine._model.generate.assert_called_once()
+        call_kwargs = engine._model.generate.call_args.kwargs
+        assert "ref_audio" in call_kwargs
+        assert call_kwargs["ref_text"] == "hello"
 
     def test_voice_clone_passes_ref_text(
         self, _make_clone_engine, _ref_audio_b64
     ):
-        """ref_text is forwarded to generate_voice_clone."""
+        """ref_text is forwarded to generate()."""
         import asyncio
         engine = _make_clone_engine()
         asyncio.run(engine.synthesize(
             "Hi", ref_audio=_ref_audio_b64, ref_text="reference text",
         ))
-        call_kwargs = engine._model.generate_voice_clone.call_args.kwargs
+        call_kwargs = engine._model.generate.call_args.kwargs
         assert call_kwargs["ref_text"] == "reference text"
 
     def test_voice_clone_returns_wav(
@@ -415,18 +432,24 @@ class TestTTSVoiceClone:
     ):
         """Voice-clone with empty model output raises RuntimeError."""
         import asyncio
-        engine = _make_clone_engine(clone_returns_audio=False)
+        engine = _make_clone_engine(returns_audio=False)
         with pytest.raises(RuntimeError, match="no audio"):
             asyncio.run(engine.synthesize(
                 "Fail", ref_audio=_ref_audio_b64, ref_text="fail",
             ))
 
-    def test_voice_clone_missing_method_raises(self, _ref_audio_b64):
-        """Model without generate_voice_clone raises RuntimeError."""
+    def test_voice_clone_unsupported_model_raises(self, _ref_audio_b64):
+        """Model whose generate() lacks ref_audio raises RuntimeError."""
         import asyncio
         from omlx.engine.tts import TTSEngine
         engine = TTSEngine("no-clone-model")
-        mock_model = MagicMock(spec=[])  # no attributes
+        mock_model = MagicMock()
+        import numpy as np
+        chunk = MagicMock()
+        chunk.audio = np.zeros(1000, dtype=np.float32)
+        chunk.sample_rate = 22050
+        mock_model.generate = MagicMock(return_value=[chunk])
+        mock_model.generate.__signature__ = TestTTSVoiceClone._NO_CLONE_SIG
         engine._model = mock_model
         with pytest.raises(RuntimeError, match="does not support voice cloning"):
             asyncio.run(engine.synthesize(
@@ -434,25 +457,13 @@ class TestTTSVoiceClone:
             ))
 
     def test_without_ref_audio_uses_generate(self, _make_clone_engine):
-        """Without ref_audio, the standard generate() path is used."""
+        """Without ref_audio, generate() is called without ref_audio param."""
         import asyncio
-        import numpy as np
         engine = _make_clone_engine()
-        # Make generate() return audio so it doesn't raise
-        chunk = MagicMock()
-        chunk.audio = np.zeros(1000, dtype=np.float32)
-        chunk.sample_rate = 22050
-        engine._model.generate.return_value = [chunk]
-        import inspect
-        engine._model.generate.__signature__ = inspect.Signature(
-            parameters=[
-                inspect.Parameter("text", inspect.Parameter.POSITIONAL_OR_KEYWORD),
-                inspect.Parameter("verbose", inspect.Parameter.POSITIONAL_OR_KEYWORD, default=False),
-            ]
-        )
         asyncio.run(engine.synthesize("Hello"))
         engine._model.generate.assert_called_once()
-        engine._model.generate_voice_clone.assert_not_called()
+        call_kwargs = engine._model.generate.call_args.kwargs
+        assert "ref_audio" not in call_kwargs
 
     def test_ref_audio_temp_file_cleaned_up(
         self, _make_clone_engine, _ref_audio_b64
@@ -461,15 +472,16 @@ class TestTTSVoiceClone:
         import asyncio
         import os
         engine = _make_clone_engine()
-        # Capture the ref_audio path passed to generate_voice_clone
         captured_path = []
-        original = engine._model.generate_voice_clone
+        original_generate = engine._model.generate
 
         def _capture(*args, **kwargs):
-            captured_path.append(kwargs.get("ref_audio", args[2] if len(args) > 2 else None))
-            return original(*args, **kwargs)
+            if "ref_audio" in kwargs:
+                captured_path.append(kwargs["ref_audio"])
+            return original_generate(*args, **kwargs)
 
-        engine._model.generate_voice_clone = _capture
+        engine._model.generate = _capture
+        engine._model.generate.__signature__ = TestTTSVoiceClone._CLONE_SIG
         asyncio.run(engine.synthesize(
             "Test", ref_audio=_ref_audio_b64, ref_text="test",
         ))
