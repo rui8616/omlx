@@ -32,10 +32,14 @@ class _IntOffsetCacheProxy:
     """Proxy that converts mx.array cache.offset to Python int.
 
     mlx-lm's BatchKVCache stores ``offset`` as ``mx.array`` for efficient
-    batched updates, but mlx-vlm models (e.g., Qwen3.5) use ``cache.offset``
-    as a slice index which requires a Python int.  This proxy transparently
-    converts on read while leaving internal cache operations (which access
-    ``self.offset`` on the real object) unaffected.
+    batched updates, but mlx-vlm models use ``cache.offset`` as a scalar
+    (e.g. for slice indices, mx.arange, int() casts).  This proxy
+    converts on read while leaving internal cache operations unaffected.
+
+    For batched decode with multiple requests of different prompt lengths,
+    max(offset) is used.  This is correct for the longest request but
+    gives slightly wrong RoPE positions for shorter requests.
+    Proper per-element offset support requires upstream mlx-vlm changes.
     """
 
     __slots__ = ("_cache",)
@@ -47,16 +51,6 @@ class _IntOffsetCacheProxy:
     def offset(self):
         raw = self._cache.offset
         if isinstance(raw, mx.array):
-            # Return the maximum offset across batch elements.
-            # For BatchKVCache: max(offset) == _idx (the shared buffer
-            # write position), because the longest request has zero
-            # left_padding.  This is correct for mask sizing — mlx-vlm
-            # computes kv_seq_len from this value before update_and_fetch.
-            # For BatchRotatingKVCache: the mx.array offset never wraps
-            # (unlike _idx which resets at max_size) and is authoritative
-            # even after merge() (unlike _offset which gets set to buffer
-            # size).  max() is safe for both cache types with no
-            # duck-typing on internal attributes.
             if raw.ndim == 0:
                 return int(raw.item())
             return int(raw.max().item())
@@ -112,16 +106,20 @@ class VLMModelAdapter(nn.Module):
         _embed_offset: Current chunk offset during chunked prefill
     """
 
-    def __init__(self, vlm_model: nn.Module):
+    def __init__(self, vlm_model: nn.Module, decode_model: Optional[nn.Module] = None):
         """
         Initialize the adapter.
 
         Args:
             vlm_model: The full VLM model loaded by mlx_vlm.utils.load()
+            decode_model: Optional mlx-lm model for batched decode.
+                When provided, this model handles batched decode (batch > 1)
+                while vlm_model handles VLM prefill and single-request decode.
         """
         super().__init__()
         self._vlm_model = vlm_model
         self._language_model = vlm_model.language_model
+        self._decode_model = decode_model
 
         # Pending vision embeddings state (set before prefill, cleared after)
         self._pending_embeds: Optional[mx.array] = None
@@ -257,14 +255,15 @@ class VLMModelAdapter(nn.Module):
             # Legacy single-request path
             result = self._forward_with_embeddings(input_ids, wrapped_cache, **kwargs)
         else:
-            # Standard decode path: token IDs only.
-            # VLM models that reuse another architecture's LanguageModel
-            # (e.g., MiniCPM-o using qwen3_vl) rely on position state being
-            # initialized by the full Model.__call__(). Since omlx calls the
-            # language model directly, replicate that initialization here.
-            if hasattr(self._vlm_model, "_set_position_state"):
-                self._vlm_model._set_position_state(input_ids)
-            result = self._language_model(input_ids, cache=wrapped_cache, **kwargs)
+            # Standard decode/prefill path: token IDs only.
+            # Use mlx-lm decode model for batched decode (batch > 1)
+            # since mlx-vlm language models may not handle batching.
+            if self._decode_model is not None and input_ids.shape[0] > 1:
+                result = self._decode_model(input_ids, cache=cache, **kwargs)
+            else:
+                if hasattr(self._vlm_model, "_set_position_state"):
+                    self._vlm_model._set_position_state(input_ids)
+                result = self._language_model(input_ids, cache=wrapped_cache, **kwargs)
 
         # mlx-vlm models return LanguageModelOutput(logits=...) but
         # mlx-lm's BatchGenerator expects raw mx.array logits.

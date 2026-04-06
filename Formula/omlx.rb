@@ -1,11 +1,13 @@
 class Omlx < Formula
   desc "LLM inference server optimized for Apple Silicon"
   homepage "https://github.com/jundot/omlx"
-  url "https://github.com/jundot/omlx/archive/refs/tags/v0.3.0.tar.gz"
-  sha256 "8ab2077a3c6f0dd91b63fa11ec4c30d44330991fa37db91d8a4f8ab385bfab8d"
+  url "https://github.com/jundot/omlx/archive/refs/tags/v0.3.4.tar.gz"
+  sha256 "441f6e4c7abc8278f901d5866dd1bb43be3d37146e160e764d8c753f8f8338a5"
   license "Apache-2.0"
 
   head "https://github.com/jundot/omlx.git", branch: "main"
+
+  option "with-grammar", "Install xgrammar for structured output (requires torch, ~2GB)"
 
   depends_on "rust" => :build
   depends_on "python@3.11"
@@ -36,13 +38,14 @@ class Omlx < Formula
     # Homebrew dylib ID fixup failure (Mach-O header too small for absolute paths)
     ENV.append "LDFLAGS", "-Wl,-headerpad_max_install_names"
 
-    # Install omlx without audio extra first
-    system libexec/"bin/pip", "install", "--no-binary", "pydantic-core,rpds-py,tiktoken,tokenizers", buildpath.to_s
+    # Install omlx (with optional grammar extra for structured output)
+    install_spec = build.with?("grammar") ? "#{buildpath}[grammar]" : buildpath.to_s
+    system libexec/"bin/pip", "install", "--no-binary", "pydantic-core,rpds-py,tiktoken,tokenizers", install_spec
 
     # Install mlx-audio with patched mlx-lm pin to avoid version conflict
     resource("mlx-audio").stage do
       inreplace "pyproject.toml", '"mlx-lm==0.31.1"', '"mlx-lm>=0.31.1"'
-      system libexec/"bin/pip", "install", "."
+      system libexec/"bin/pip", "install", ".[all]"
     end
 
     # python-multipart is declared in omlx's [audio] extra, not in mlx-audio

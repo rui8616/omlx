@@ -106,6 +106,26 @@ class BatchedEngine(BaseEngine):
         return None
 
     @property
+    def message_extractor(self):
+        """Return the model-specific message extractor function, or ``None``.
+
+        ``None`` means the server should use its default extractor
+        (``extract_text_content`` or ``extract_multimodal_content``).
+        """
+        try:
+            from ..adapter.output_parser import detect_message_extractor
+            model_config = None
+            if self._model is not None and hasattr(self._model, "config"):
+                cfg = self._model.config
+                if hasattr(cfg, "model_type"):
+                    model_config = {"model_type": cfg.model_type}
+                elif isinstance(cfg, dict):
+                    model_config = cfg
+            return detect_message_extractor(self._model_name, model_config)
+        except Exception:
+            return None
+
+    @property
     def grammar_compiler(self):
         """Lazily create and return a GrammarCompiler for this model.
 
@@ -121,8 +141,26 @@ class BatchedEngine(BaseEngine):
 
             self._grammar_compiler = create_grammar_compiler(self._tokenizer, self._model)
             logger.info("GrammarCompiler initialized for %s", self._model_name)
-        except Exception as e:
-            logger.warning("Failed to initialize GrammarCompiler: %s", e)
+        except Exception:
+            from ..utils.install import get_install_method
+
+            method = get_install_method()
+            if method == "dmg":
+                logger.info(
+                    "Structured output is not available in the DMG version "
+                    "(xgrammar requires torch which significantly increases app size). "
+                    "Use the pip or Homebrew version for structured output support."
+                )
+            elif method == "homebrew":
+                logger.info(
+                    "Structured output requires xgrammar. "
+                    "Reinstall with: brew reinstall omlx --with-grammar"
+                )
+            else:
+                logger.info(
+                    "Structured output requires xgrammar. "
+                    "Install with: pip install 'omlx[grammar]'"
+                )
         return self._grammar_compiler
 
     def _preprocess_messages(
@@ -189,7 +227,7 @@ class BatchedEngine(BaseEngine):
             if tq_enabled:
                 from ..patches.turboquant_attention import apply_turboquant_attention_patch
                 apply_turboquant_attention_patch()
-                tq_bits = int(getattr(self._model_settings, "turboquant_kv_bits", 4))
+                tq_bits = float(getattr(self._model_settings, "turboquant_kv_bits", 4))
                 logger.info(f"TurboQuant KV cache enabled: {tq_bits} bits")
 
         # Create engine config (copy to avoid mutating the shared instance)
@@ -214,7 +252,7 @@ class BatchedEngine(BaseEngine):
         if self._model_settings is not None:
             tq_enabled = getattr(self._model_settings, "turboquant_kv_enabled", False)
             if tq_enabled:
-                tq_bits = int(getattr(self._model_settings, "turboquant_kv_bits", 4))
+                tq_bits = float(getattr(self._model_settings, "turboquant_kv_bits", 4))
                 self._engine.engine.scheduler._turboquant_kv_bits = tq_bits
 
         # SpecPrefill: load draft model and pass to scheduler
@@ -626,6 +664,16 @@ class BatchedEngine(BaseEngine):
             **kwargs,
         ):
             yield output
+
+    def has_active_requests(self) -> bool:
+        """Check if the engine has active in-flight requests."""
+        engine_core = getattr(self, "_engine", None)
+        if engine_core is not None:
+            inner = getattr(engine_core, "engine", None)
+            if inner is not None:
+                collectors = getattr(inner, "_output_collectors", {})
+                return len(collectors) > 0
+        return False
 
     def get_stats(self) -> dict[str, Any]:
         """Get engine statistics."""

@@ -33,6 +33,7 @@ import mlx.core as mx
 
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_special_tokens, detect_and_strip_partial
+from ..cache.vision_feature_cache import VisionFeatureSSDCache
 from ..models.vlm import VLMModelAdapter
 from ..utils.image import (
     compute_image_hash,
@@ -90,6 +91,8 @@ OCR_MODEL_GENERATION_DEFAULTS: Dict[str, Dict[str, Any]] = {
 }
 
 _video_processor_patched = False
+_gemma4_vision_patched = False
+_gemma4_batched_decode_patched = False
 
 
 def _patch_video_processor_bug():
@@ -119,6 +122,303 @@ def _patch_video_processor_bug():
         pass
 
 
+def _patch_gemma4_vision_tower(vlm_model):
+    """Patch Gemma 4 vision tower to handle multi-image with different resolutions.
+
+    mlx-vlm's Gemma 4 vision tower does mx.concatenate(pixel_values, axis=0)
+    when pixel_values is a list, but prepare_inputs() returns a list of numpy
+    ndarrays with different spatial dims when images have different resolutions.
+    This crashes because (a) they're not mx.arrays and (b) different H/W can't
+    be concatenated.
+
+    Fix: process each image through the vision tower individually, then
+    concatenate the output features (which are all (1, max_patches, hidden)).
+    """
+    global _gemma4_vision_patched
+    if _gemma4_vision_patched:
+        return
+
+    try:
+        import mlx.core as mx_local
+
+        from mlx_vlm.models.gemma4 import vision as gemma4_vision
+
+        VisionModel = gemma4_vision.VisionModel
+        original_call = VisionModel.__call__
+
+        def patched_call(self, pixel_values):
+            if isinstance(pixel_values, list):
+                features = []
+                for pv in pixel_values:
+                    if not isinstance(pv, mx_local.array):
+                        pv = mx_local.array(pv)
+                    if pv.ndim == 3:
+                        pv = pv[None]  # (C, H, W) → (1, C, H, W)
+                    features.append(original_call(self, pv))
+                # Concat along patch dim — masked_scatter flattens
+                # source sequentially, so patch order must match
+                # image token order in the input sequence.
+                return mx_local.concatenate(features, axis=1)
+            return original_call(self, pixel_values)
+
+        VisionModel.__call__ = patched_call
+        _gemma4_vision_patched = True
+        logger.debug("Applied Gemma 4 multi-image vision tower patch")
+    except (ImportError, AttributeError):
+        pass
+
+
+def _patch_gemma4_batched_decode():
+    """Patch mlx-vlm's gemma4 model for correct batched decode.
+
+    mlx-vlm's gemma4 reads shared KVs via cache.state which breaks in
+    batched mode. This patch replaces it with mlx-lm's approach: explicit
+    shared_kv/offset passing through intermediates[].
+
+    Also patches ProportionalRoPE to handle per-element array offsets
+    needed for batched decode with different prompt lengths.
+    """
+    global _gemma4_batched_decode_patched
+    if _gemma4_batched_decode_patched:
+        return
+
+    try:
+        from mlx_vlm.models.gemma4.language import (
+            Attention,
+            DecoderLayer,
+            Gemma4TextModel,
+            LanguageModel,
+            scaled_dot_product_attention,
+        )
+        from mlx_vlm.models.gemma4.rope_utils import ProportionalRoPE
+
+        # ── 1. Patch ProportionalRoPE for per-element array offsets ──
+
+        _orig_rope = ProportionalRoPE.__call__
+
+        def _patched_rope(self, x, offset=0):
+            if isinstance(offset, mx.array) and offset.size > 1:
+                parts = []
+                for i in range(offset.size):
+                    parts.append(
+                        _orig_rope(self, x[i : i + 1], offset=int(offset[i].item()))
+                    )
+                return mx.concatenate(parts, axis=0)
+            return _orig_rope(self, x, offset=offset)
+
+        ProportionalRoPE.__call__ = _patched_rope
+
+        # ── 2. Patch Attention.__call__ to pass shared_kv/offset ──
+
+        def _patched_attn(self, x, mask=None, cache=None, shared_kv=None, offset=None):
+            B, L, _ = x.shape
+
+            queries = self.q_proj(x).reshape(B, L, self.n_heads, self.head_dim)
+            queries = self.q_norm(queries)
+
+            if shared_kv is not None:
+                keys, values = shared_kv
+            else:
+                if offset is None:
+                    offset = cache.offset if cache is not None else 0
+
+                keys = self.k_proj(x).reshape(B, L, self.n_kv_heads, self.head_dim)
+                if self.use_k_eq_v:
+                    values = keys
+                else:
+                    values = self.v_proj(x).reshape(
+                        B, L, self.n_kv_heads, self.head_dim
+                    )
+
+                keys = self.k_norm(keys)
+                values = self.v_norm(values)
+                values = values.transpose(0, 2, 1, 3)
+
+                keys = keys.transpose(0, 2, 1, 3)
+                keys = self.rope(keys, offset=offset)
+
+                if cache is not None:
+                    keys, values = cache.update_and_fetch(keys, values)
+
+            queries = queries.transpose(0, 2, 1, 3)
+            queries = self.rope(queries, offset=offset)
+
+            if mask is not None and isinstance(mask, mx.array):
+                if mask.shape[-1] != keys.shape[-2]:
+                    mask = mask[..., -keys.shape[-2] :]
+
+            output = scaled_dot_product_attention(
+                queries, keys, values, cache=cache, scale=self.scale, mask=mask
+            )
+            output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
+            return self.o_proj(output), (keys, values), offset
+
+        Attention.__call__ = _patched_attn
+
+        # ── 3. Patch DecoderLayer.__call__ to propagate shared_kv/offset ──
+
+        def _patched_layer(
+            self, x, mask=None, cache=None, per_layer_input=None,
+            shared_kv=None, offset=None,
+        ):
+            import mlx.nn as nn
+
+            residual = x
+            h = self.input_layernorm(x)
+            h, shared_kv, offset = self.self_attn(
+                h, mask, cache, shared_kv=shared_kv, offset=offset
+            )
+            h = self.post_attention_layernorm(h)
+            h = residual + h
+
+            residual = h
+            if self.enable_moe:
+                h1 = self.pre_feedforward_layernorm(h)
+                h1 = self.mlp(h1)
+                h1 = self.post_feedforward_layernorm_1(h1)
+                top_k_indices, top_k_weights = self.router(h)
+                h2 = self.pre_feedforward_layernorm_2(h)
+                h2 = self.experts(h2, top_k_indices, top_k_weights)
+                h2 = self.post_feedforward_layernorm_2(h2)
+                h = h1 + h2
+            else:
+                h = self.pre_feedforward_layernorm(h)
+                h = self.mlp(h)
+
+            h = self.post_feedforward_layernorm(h)
+            h = residual + h
+
+            if (
+                self.per_layer_input_gate is not None
+                and self.per_layer_projection is not None
+                and self.post_per_layer_input_norm is not None
+                and per_layer_input is not None
+            ):
+                residual = h
+                gate = self.per_layer_input_gate(h)
+                gate = nn.gelu_approx(gate)
+                gate = mx.multiply(gate, per_layer_input)
+                gate = self.per_layer_projection(gate)
+                gate = self.post_per_layer_input_norm(gate)
+                h = residual + gate
+
+            if self.layer_scalar is not None:
+                h = h * self.layer_scalar
+
+            return h, shared_kv, offset
+
+        DecoderLayer.__call__ = _patched_layer
+
+        # ── 4. Patch the model's layer loop for intermediates-based KV sharing ──
+
+        from mlx_vlm.models.gemma4.language import Gemma4TextModel
+
+        def _patched_model_call(
+            self, inputs=None, inputs_embeds=None, mask=None, cache=None,
+            per_layer_inputs=None, **kwargs,
+        ):
+            # Embed tokens (same as original Gemma4TextModel)
+            if inputs_embeds is None:
+                h = self.embed_tokens(inputs)
+                h = h * self.embed_scale
+            else:
+                h = inputs_embeds
+
+            # Per-layer input processing
+            if self.hidden_size_per_layer_input:
+                if inputs is not None and per_layer_inputs is None:
+                    per_layer_inputs = self.get_per_layer_inputs(inputs)
+                elif per_layer_inputs is not None:
+                    target_len = h.shape[1]
+                    if per_layer_inputs.shape[1] != target_len:
+                        cache_offset = next(
+                            (
+                                int(c.offset) if not isinstance(c.offset, mx.array)
+                                else int(c.offset.max().item())
+                                for c in (cache or [])
+                                if c is not None and hasattr(c, "offset")
+                            ),
+                            0,
+                        )
+                        max_start = max(per_layer_inputs.shape[1] - target_len, 0)
+                        start = min(cache_offset, max_start)
+                        per_layer_inputs = per_layer_inputs[:, start : start + target_len]
+                if per_layer_inputs is not None or inputs is not None:
+                    per_layer_inputs = self.project_per_layer_inputs(h, per_layer_inputs)
+
+            # Build previous_kvs mapping if not cached
+            if not hasattr(self, "_previous_kvs"):
+                self._previous_kvs = list(range(len(self.layers)))
+                num_shared = getattr(
+                    self, "first_kv_shared_layer_idx", len(self.layers)
+                )
+                if num_shared < len(self.layers):
+                    kvs_by_type = {}
+                    for i in range(num_shared):
+                        kvs_by_type[self.layers[i].layer_type] = i
+                    for j in range(num_shared, len(self.layers)):
+                        lt = self.layers[j].layer_type
+                        if lt in kvs_by_type:
+                            self._previous_kvs[j] = kvs_by_type[lt]
+
+            if cache is None:
+                cache = [None] * getattr(
+                    self, "first_kv_shared_layer_idx", len(self.layers)
+                )
+
+            from mlx_lm.models.base import create_attention_mask
+
+            if mask is None:
+                full_idx = getattr(self, "first_full_cache_idx", 0)
+                slide_idx = getattr(self, "first_sliding_cache_idx", 0)
+                global_mask = create_attention_mask(
+                    h,
+                    cache[full_idx] if full_idx < len(cache) else None,
+                )
+                sliding_window_mask = create_attention_mask(
+                    h,
+                    cache[slide_idx] if slide_idx < len(cache) else None,
+                    window_size=getattr(self, "window_size", None),
+                )
+
+            intermediates = [(None, None)] * len(self.layers)
+            for i, layer in enumerate(self.layers):
+                c = cache[self.layer_idx_to_cache_idx[i]]
+                is_global = layer.layer_type == "full_attention"
+
+                local_mask = mask
+                if mask is None and is_global:
+                    local_mask = global_mask
+                elif mask is None:
+                    local_mask = sliding_window_mask
+
+                per_layer_input = None
+                if per_layer_inputs is not None:
+                    per_layer_input = per_layer_inputs[:, :, i, :]
+
+                kvs, offset = intermediates[self._previous_kvs[i]]
+
+                h, kvs, offset = layer(
+                    h,
+                    local_mask,
+                    c,
+                    per_layer_input=per_layer_input,
+                    shared_kv=kvs,
+                    offset=offset,
+                )
+
+                intermediates[i] = (kvs, offset)
+
+            return self.norm(h)
+
+        Gemma4TextModel.__call__ = _patched_model_call
+
+        _gemma4_batched_decode_patched = True
+        logger.debug("Applied Gemma 4 batched decode patch")
+    except (ImportError, AttributeError) as e:
+        logger.debug("Gemma 4 batched decode patch failed: %s", e)
+
+
 # Models that only support a single image per request
 SINGLE_IMAGE_ONLY_MODELS = {
     "llava_next",
@@ -127,6 +427,12 @@ SINGLE_IMAGE_ONLY_MODELS = {
     "paligemma",
     "multi_modality",
     "mllama",
+}
+
+# Qwen-style VLMs: vision_tower takes (pixel_values, grid_thw)
+_QWEN_VISION_MODELS = {
+    "qwen3_5", "qwen3_5_moe", "qwen3_vl", "qwen3_vl_moe",
+    "qwen2_vl", "qwen2_5_vl",
 }
 
 
@@ -163,6 +469,8 @@ class VLMBatchedEngine(BaseEngine):
         self._loaded = False
         self._grammar_compiler = None
         self._grammar_compiler_init_attempted = False
+        self._vision_cache = None
+        self._vision_cache_enabled = True
 
     @property
     def model_name(self) -> str:
@@ -181,6 +489,16 @@ class VLMBatchedEngine(BaseEngine):
         return None
 
     @property
+    def message_extractor(self):
+        """Return the model-specific message extractor function, or ``None``."""
+        try:
+            from ..adapter.output_parser import detect_message_extractor
+            model_config = {"model_type": self.model_type} if self.model_type else None
+            return detect_message_extractor(self._model_name, model_config)
+        except Exception:
+            return None
+
+    @property
     def is_ocr_model(self) -> bool:
         return (self.model_type or "") in OCR_MODEL_TYPES
 
@@ -197,8 +515,26 @@ class VLMBatchedEngine(BaseEngine):
 
             self._grammar_compiler = create_grammar_compiler(self._tokenizer, self._vlm_model)
             logger.info("GrammarCompiler initialized for %s", self._model_name)
-        except Exception as e:
-            logger.warning("Failed to initialize GrammarCompiler: %s", e)
+        except Exception:
+            from ..utils.install import get_install_method
+
+            method = get_install_method()
+            if method == "dmg":
+                logger.info(
+                    "Structured output is not available in the DMG version "
+                    "(xgrammar requires torch which significantly increases app size). "
+                    "Use the pip or Homebrew version for structured output support."
+                )
+            elif method == "homebrew":
+                logger.info(
+                    "Structured output requires xgrammar. "
+                    "Reinstall with: brew reinstall omlx --with-grammar"
+                )
+            else:
+                logger.info(
+                    "Structured output requires xgrammar. "
+                    "Install with: pip install 'omlx[grammar]'"
+                )
         return self._grammar_compiler
 
     def _resolve_ocr_stop_token_ids(self) -> list[int]:
@@ -246,6 +582,7 @@ class VLMBatchedEngine(BaseEngine):
             # when torchvision is not available (extractors is None, `in` fails).
             # oMLX does not support video input, so we skip video processing.
             _patch_video_processor_bug()
+            _patch_gemma4_vision_tower(None)  # patch class before model load
             return vlm_load(self._model_name)
 
         loop = asyncio.get_running_loop()
@@ -253,14 +590,67 @@ class VLMBatchedEngine(BaseEngine):
             get_mlx_executor(), _load_vlm_sync
         )
 
+        # Initialize vision feature cache
+        vision_ssd_dir = None
+        if self._scheduler_config and getattr(
+            self._scheduler_config, "paged_ssd_cache_dir", None
+        ):
+            from pathlib import Path as _Path
+
+            vision_ssd_dir = _Path(self._scheduler_config.paged_ssd_cache_dir) / "vision_features"
+        self._vision_cache = VisionFeatureSSDCache(
+            cache_dir=vision_ssd_dir,
+            max_memory_entries=20,
+        )
+        logger.info("Vision feature cache enabled (SSD: %s)", vision_ssd_dir or "disabled")
+
         # Extract tokenizer from processor
         if hasattr(self._processor, "tokenizer"):
             self._tokenizer = self._processor.tokenizer
         else:
             self._tokenizer = self._processor
 
+        # Build mlx-lm decode model for batched decode by sharing VLM weights.
+        # mlx-vlm language models may produce degenerated output in batched
+        # decode (e.g. gemma4 missing KV sharing between layers).
+        # The LM model is constructed without evaluating initial random weights
+        # (MLX lazy eval) then load_weights replaces them with VLM's arrays
+        # by reference — zero additional GPU memory.
+        self._lm_model = None
+        try:
+            from pathlib import Path as _Path
+
+            from mlx.utils import tree_flatten
+            from mlx_lm.utils import load_model
+
+            def _build_decode_model():
+                # Create LM model with lazy=True: reads disk headers for correct
+                # quantized structure but does NOT evaluate weights → 0 GPU memory.
+                lm_model, _ = load_model(
+                    _Path(self._model_name), lazy=True
+                )
+                # Replace lazy weights with VLM's evaluated arrays by reference.
+                # VLM params "model.*" map to LM "language_model.model.*".
+                vlm_params = dict(tree_flatten(
+                    self._vlm_model.language_model.parameters()
+                ))
+                lm_params = [
+                    ("language_model." + k, v) for k, v in vlm_params.items()
+                ]
+                lm_model.load_weights(lm_params, strict=False)
+                return lm_model
+
+            self._lm_model = await loop.run_in_executor(
+                get_mlx_executor(), _build_decode_model
+            )
+            logger.info("VLM decode model ready (weight sharing, zero-copy)")
+        except Exception as e:
+            logger.warning("mlx-lm decode model failed, using vlm fallback: %s", e)
+
         # Create VLM model adapter wrapping language_model
-        self._adapter = VLMModelAdapter(self._vlm_model)
+        self._adapter = VLMModelAdapter(
+            self._vlm_model, decode_model=self._lm_model
+        )
 
         # Create scheduler config
         scheduler_config = (
@@ -291,7 +681,7 @@ class VLMBatchedEngine(BaseEngine):
             if tq_enabled:
                 from ..patches.turboquant_attention import apply_turboquant_attention_patch
                 apply_turboquant_attention_patch()
-                tq_bits = int(getattr(self._model_settings, "turboquant_kv_bits", 4))
+                tq_bits = float(getattr(self._model_settings, "turboquant_kv_bits", 4))
                 self._engine.engine.scheduler._turboquant_kv_bits = tq_bits
                 logger.info(f"TurboQuant KV cache enabled for VLM: {tq_bits} bits")
 
@@ -325,6 +715,9 @@ class VLMBatchedEngine(BaseEngine):
         if self._engine:
             await self._engine.stop()
             self._engine.engine.close()
+        if self._vision_cache is not None:
+            self._vision_cache.close()
+            self._vision_cache = None
         self._engine = None
         self._vlm_model = None
         self._processor = None
@@ -334,37 +727,53 @@ class VLMBatchedEngine(BaseEngine):
         logger.info("VLMBatchedEngine stopped")
 
     def _inject_tool_calling(self, tokenizer) -> None:
-        """Inject mlx-lm's tool calling attributes into VLM tokenizer.
+        """Inject tool calling attributes into VLM tokenizer.
 
         mlx-vlm's TokenizerWrapper lacks tool calling support (has_tool_calling,
-        tool_parser, etc). We reuse mlx-lm's _infer_tool_parser() to detect the
-        parser type from the chat template, then set the attributes directly on
-        the wrapper instance so parse_tool_calls() can use native tool parsing.
+        tool_parser, etc). We prefer mlx_vlm.tool_parsers which is a superset of
+        mlx_lm's — it recognises additional markers such as Gemma4's <|tool_call>
+        and loads the correct per-model parser.  Falls back to mlx_lm if the
+        mlx_vlm.tool_parsers package is not present.
         """
-        try:
-            from mlx_lm.tokenizer_utils import _infer_tool_parser
-        except ImportError:
-            return
-
         chat_template = getattr(tokenizer, "chat_template", None)
         if not chat_template:
             return
 
-        tool_parser_type = _infer_tool_parser(chat_template)
-        if tool_parser_type is None:
-            return
-
+        # Prefer mlx_vlm.tool_parsers (superset; knows about Gemma4 etc.)
         try:
-            import importlib
+            from mlx_vlm.tool_parsers import (
+                _infer_tool_parser,
+                load_tool_module,
+            )
 
-            tool_module = importlib.import_module(
-                f"mlx_lm.tool_parsers.{tool_parser_type}"
-            )
+            tool_parser_type = _infer_tool_parser(chat_template)
+            if tool_parser_type is None:
+                return
+            try:
+                tool_module = load_tool_module(tool_parser_type)
+            except ImportError:
+                logger.warning(f"VLM tool parser module not found: {tool_parser_type}")
+                return
         except ImportError:
-            logger.warning(
-                f"VLM tool parser module not found: {tool_parser_type}"
-            )
-            return
+            # Fallback: mlx_lm only (no Gemma4 support)
+            try:
+                import importlib
+
+                from mlx_lm.tokenizer_utils import (
+                    _infer_tool_parser as _mlx_lm_infer,
+                )
+            except ImportError:
+                return
+            tool_parser_type = _mlx_lm_infer(chat_template)
+            if tool_parser_type is None:
+                return
+            try:
+                tool_module = importlib.import_module(
+                    f"mlx_lm.tool_parsers.{tool_parser_type}"
+                )
+            except ImportError:
+                logger.warning(f"VLM tool parser module not found: {tool_parser_type}")
+                return
 
         tool_call_start = tool_module.tool_call_start
         tool_call_end = tool_module.tool_call_end
@@ -461,6 +870,69 @@ class VLMBatchedEngine(BaseEngine):
             )
 
         return formatted_messages
+
+    def _compute_vision_features(
+        self, pixel_values: Any, extra_model_inputs: dict
+    ) -> Optional[mx.array]:
+        """Compute vision features for caching.
+
+        Tries multiple strategies based on model architecture:
+        1. model.encode_image() — upstream mlx-vlm API (e.g. gemma4)
+        2. Direct vision_tower call for qwen-style models
+        3. Direct vision_tower + projector for llava-style models
+        4. Returns None for unsupported models
+
+        Args:
+            pixel_values: Preprocessed image tensors from prepare_inputs().
+            extra_model_inputs: Additional model-specific inputs (e.g. image_grid_thw).
+
+        Returns:
+            Computed vision features (mx.array), or None if unsupported.
+        """
+        model = self._vlm_model
+        model_type = self.model_type or ""
+
+        # Strategy 1: upstream encode_image (gemma4 and future models)
+        if hasattr(model, "encode_image"):
+            return model.encode_image(pixel_values)
+
+        # Strategy 2: qwen-style (vision_tower + grid_thw)
+        if model_type in _QWEN_VISION_MODELS:
+            grid_thw = extra_model_inputs.get("image_grid_thw")
+            if grid_thw is None:
+                grid_thw = extra_model_inputs.get("video_grid_thw")
+            if grid_thw is None:
+                return None
+            dtype = model.vision_tower.patch_embed.proj.weight.dtype
+            pv = mx.array(pixel_values) if not isinstance(pixel_values, mx.array) else pixel_values
+            pv = pv.astype(dtype)
+            result = model.vision_tower(pv, grid_thw)
+            # qwen3_5 returns (hidden_states, _), qwen2_vl returns hidden_states
+            if isinstance(result, tuple):
+                return result[0]
+            return result
+
+        # Strategy 3: llava-style (vision_tower → layer select → projector)
+        if model_type == "llava":
+            pv = pixel_values
+            if not isinstance(pv, mx.array):
+                pv = mx.array(pv)
+            *_, hidden_states = model.vision_tower(
+                pv.transpose(0, 2, 3, 1), output_hidden_states=True
+            )
+            selected = hidden_states[model.vision_feature_layer]
+            if isinstance(model.vision_feature_layer, int):
+                if getattr(model, "vision_feature_select_strategy", "default") == "default":
+                    selected = selected[:, 1:]
+            else:
+                hs_pool = [hidden_states[idx] for idx in model.vision_feature_layer]
+                if getattr(model, "vision_feature_select_strategy", "default") == "default":
+                    hs_pool = [hs[:, 1:] for hs in hs_pool]
+                selected = mx.concatenate(hs_pool, axis=-1)
+            return model.multi_modal_projector(selected)
+
+        # Unsupported model: skip caching
+        return None
 
     def _prepare_vision_inputs(
         self,
@@ -595,12 +1067,61 @@ class VLMBatchedEngine(BaseEngine):
         }
 
         if pixel_values is not None and num_images > 0:
+            # Compute image hash FIRST for vision feature cache lookup
+            image_hash = compute_image_hash(images)
+
+            # Build call kwargs from extra_model_inputs
+            call_kwargs = dict(extra_model_inputs)
+
+            # Try vision feature cache
+            if self._vision_cache is not None and self._vision_cache_enabled and image_hash:
+                cached_features = self._vision_cache.get(image_hash, self._model_name)
+                if cached_features is not None:
+                    call_kwargs["cached_image_features"] = cached_features
+                    logger.debug("Vision feature cache hit: %s", image_hash[:16])
+                else:
+                    try:
+                        features = self._compute_vision_features(
+                            pixel_values, extra_model_inputs
+                        )
+                        if features is not None:
+                            mx.eval(features)
+                            self._vision_cache.put(
+                                image_hash, self._model_name, features
+                            )
+                            call_kwargs["cached_image_features"] = features
+                            logger.debug(
+                                "Vision feature cache miss, stored: %s",
+                                image_hash[:16],
+                            )
+                    except Exception:
+                        logger.debug(
+                            "Vision feature computation failed, using full pipeline",
+                            exc_info=True,
+                        )
+
             # Run vision encoder + embedding merge.
             # Pass attention_mask as 'mask' — mlx-vlm models (e.g. Gemma 3)
             # expect it as a positional/keyword arg named 'mask'.
-            embed_features = self._vlm_model.get_input_embeddings(
-                input_ids, pixel_values, mask=attention_mask, **extra_model_inputs
-            )
+            try:
+                embed_features = self._vlm_model.get_input_embeddings(
+                    input_ids, pixel_values, mask=attention_mask, **call_kwargs
+                )
+            except TypeError:
+                # cached_image_features kwarg not supported — disable and retry
+                if "cached_image_features" in call_kwargs:
+                    logger.warning(
+                        "cached_image_features not supported by %s, "
+                        "disabling vision feature cache",
+                        self.model_type,
+                    )
+                    self._vision_cache_enabled = False
+                    call_kwargs.pop("cached_image_features")
+                    embed_features = self._vlm_model.get_input_embeddings(
+                        input_ids, pixel_values, mask=attention_mask, **call_kwargs
+                    )
+                else:
+                    raise
             mx.eval(embed_features.inputs_embeds)
 
             # Convert InputEmbeddingsFeatures to dict for extra kwargs
@@ -613,9 +1134,6 @@ class VLMBatchedEngine(BaseEngine):
 
             # Extract token IDs as list
             token_ids = input_ids[0].tolist() if input_ids.ndim > 1 else input_ids.tolist()
-
-            # Compute image hash for prefix cache
-            image_hash = compute_image_hash(images)
 
             return token_ids, embed_features.inputs_embeds, extra_kwargs, image_hash
         else:
@@ -1024,6 +1542,16 @@ class VLMBatchedEngine(BaseEngine):
             text_messages, template_tools, chat_template_kwargs=chat_template_kwargs
         )
         return len(self._tokenizer.encode(prompt))
+
+    def has_active_requests(self) -> bool:
+        """Check if the engine has active in-flight requests."""
+        engine_core = getattr(self, "_engine", None)
+        if engine_core is not None:
+            inner = getattr(engine_core, "engine", None)
+            if inner is not None:
+                collectors = getattr(inner, "_output_collectors", {})
+                return len(collectors) > 0
+        return False
 
     def get_stats(self) -> dict[str, Any]:
         """Get engine statistics."""

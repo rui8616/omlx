@@ -47,6 +47,7 @@ class TTSEngine(BaseNonStreamingEngine):
             model_name: HuggingFace model name or local path
             **kwargs: Additional model-specific parameters
         """
+        super().__init__()
         self._model_name = model_name
         self._model = None
         self._kwargs = kwargs
@@ -227,18 +228,23 @@ class TTSEngine(BaseNonStreamingEngine):
                 if ref_audio_path is not None:
                     self._cleanup_ref_audio(ref_audio_path)
 
-        loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(
-            get_mlx_executor(), _synthesize_sync
-        )
+        with self._active_lock:
+            self._active_count += 1
+        try:
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(
+                get_mlx_executor(), _synthesize_sync
+            )
 
-        elapsed = time.monotonic() - t0
-        mode = "voice-clone" if ref_audio_path else "synthesize"
-        logger.info(
-            "TTS %s done: model=%s, %.2fs, %d bytes output",
-            mode, self._model_name, elapsed, len(result),
-        )
-        return result
+            elapsed = time.monotonic() - t0
+            logger.info(
+                "TTS synthesize done: model=%s, %.2fs, %d bytes output",
+                self._model_name, elapsed, len(result),
+            )
+            return result
+        finally:
+            with self._active_lock:
+                self._active_count -= 1
 
     # ------------------------------------------------------------------
     # Voice-clone helpers

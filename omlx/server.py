@@ -150,7 +150,7 @@ from .api.tool_calling import (
     sanitize_tool_call_markup,
 )
 from .api.thinking import ThinkingParser, extract_thinking
-from .api.utils import clean_output_text, clean_special_tokens, extract_harmony_messages, extract_multimodal_content, extract_text_content
+from .api.utils import clean_output_text, clean_special_tokens, extract_multimodal_content, extract_text_content
 from .engine import BaseEngine, BatchedEngine, VLMBatchedEngine
 from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
@@ -1046,7 +1046,7 @@ def init_server(
             logger.info("Generated and saved new auth secret key")
         from .admin.auth import init_auth
 
-        init_auth(global_settings.auth.secret_key)
+        init_auth(global_settings.auth.secret_key, lambda: _server_state.global_settings)
 
     # Configure CORS middleware from settings
     cors_origins = global_settings.server.cors_origins if global_settings else ["*"]
@@ -1857,10 +1857,9 @@ async def create_chat_completion(
 
     # Extract messages - different engines need different content handling
     is_vlm = isinstance(engine, VLMBatchedEngine)
-    if engine.model_type == "gpt_oss":
-        messages = extract_harmony_messages(
-            request.messages, max_tool_result_tokens, engine.tokenizer
-        )
+    extractor = getattr(engine, "message_extractor", None)
+    if extractor is not None:
+        messages = extractor(request.messages, max_tool_result_tokens, engine.tokenizer)
     elif is_vlm:
         # VLM: preserve image_url content parts for vision processing
         messages = extract_multimodal_content(
@@ -2268,11 +2267,26 @@ def _compile_grammar_for_request(
 
     if compiler is None:
         if structured_outputs is not None:
-            raise HTTPException(
-                status_code=400,
-                detail="Grammar-constrained decoding requires the xgrammar package. "
-                       "Install it with: pip install 'omlx[grammar]'",
-            )
+            from omlx.utils.install import get_install_method
+
+            method = get_install_method()
+            if method == "dmg":
+                detail = (
+                    "Structured output is not available in the DMG version. "
+                    "xgrammar requires torch which significantly increases app size. "
+                    "Use the pip or Homebrew version for structured output support."
+                )
+            elif method == "homebrew":
+                detail = (
+                    "Structured output requires xgrammar. "
+                    "Reinstall with: brew reinstall omlx --with-grammar"
+                )
+            else:
+                detail = (
+                    "Structured output requires xgrammar. "
+                    "Install with: pip install 'omlx[grammar]'"
+                )
+            raise HTTPException(status_code=400, detail=detail)
         return None
 
     try:
@@ -3047,6 +3061,12 @@ async def create_anthropic_message(
             request, max_tool_result_tokens, engine.tokenizer,
             preserve_images=is_vlm,
         )
+
+    # Apply model-specific message extraction (e.g. Gemma 4 converts
+    # role=tool messages into tool_responses on assistant turns).
+    extractor = getattr(engine, "message_extractor", None)
+    if extractor is not None:
+        messages = extractor(messages, max_tool_result_tokens, engine.tokenizer)
 
     # Prepare kwargs
     temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_probability, xtc_threshold = get_sampling_params(

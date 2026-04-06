@@ -15,6 +15,7 @@ Usage:
 """
 
 import argparse
+import faulthandler
 import sys
 
 
@@ -120,6 +121,13 @@ def serve_command(args):
         retention_days=settings.logging.retention_days,
     )
     print(f"Log directory: {log_dir}")
+
+    # Enable native crash diagnostics (SIGABRT, SIGSEGV, SIGFPE, SIGBUS).
+    # On Metal/MLX crashes (#511, #520), this dumps all Python thread
+    # tracebacks to the server log before the process terminates.
+    crash_log_path = log_dir / "crash.log"
+    _crash_file = open(crash_log_path, "a")
+    faulthandler.enable(file=_crash_file, all_threads=True)
 
     # Validate settings
     errors = settings.validate()
@@ -330,6 +338,7 @@ def launch_command(args):
     # Fetch model limits from server
     context_window = None
     max_tokens = None
+    model_type = None
     try:
         resp = requests.get(f"{base_url}/v1/models/status", headers=headers, timeout=5)
         if resp.ok:
@@ -337,6 +346,7 @@ def launch_command(args):
                 if m["id"] == model:
                     context_window = m.get("max_context_window")
                     max_tokens = m.get("max_tokens")
+                    model_type = m.get("model_type")
                     break
     except Exception:
         pass
@@ -352,6 +362,7 @@ def launch_command(args):
         tools_profile=tools_profile,
         context_window=context_window,
         max_tokens=max_tokens,
+        model_type=model_type,
     )
 
 
@@ -424,13 +435,10 @@ Example directory structure:
 
     # Scheduler options (for BatchedEngine)
     serve_parser.add_argument(
-        "--max-num-seqs", type=int, default=None, help="Max concurrent sequences (default: 256)"
-    )
-    serve_parser.add_argument(
-        "--completion-batch-size",
+        "--max-concurrent-requests",
         type=int,
         default=None,
-        help="Max sequences for mlx-lm BatchGenerator completion phase (token generation). (default: 32)",
+        help="Max requests processed simultaneously. Higher values increase throughput but use more memory. (default: 8)",
     )
 
     # paged SSD cache options

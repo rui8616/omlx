@@ -29,8 +29,8 @@ classifiers = [
 
 dependencies = [
     "mlx>=0.31.1",
-    # mlx-lm from latest commit (564281f)
-    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@564281f",
+    # mlx-lm from latest commit (4469ad4)
+    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@4469ad4",
     # mlx-embeddings from latest commit (32981fa)
     "mlx-embeddings @ git+https://github.com/Blaizzy/mlx-embeddings@32981fa4e8064ed664b52071789dd18271fe4206",
     # transformers version aligned with mlx-lm requirement
@@ -59,14 +59,16 @@ dependencies = [
     "jsonschema>=4.0.0",
     # Harmony format parser for gpt-oss models
     "openai-harmony",
-    # mlx-vlm from commit (7f7a04c)
-    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@7f7a04ce20337996da335ab17cdfee0ba51d6610",
+    # mlx-vlm from commit (90732bd) - optimized TurboQuant Metal kernels (0.85-1.90x baseline)
+    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@90732bdee6a361ae5003b180dc3c1b17b9d01a80",
     "Pillow>=9.0.0",
-    # Grammar-constrained decoding for structured output
-    "xgrammar>=0.1.32",
 ]
 
 [project.optional-dependencies]
+grammar = [
+    # Grammar-constrained decoding for structured output (requires torch ~2GB)
+    "xgrammar>=0.1.32",
+]
 mcp = [
     "mcp>=1.0.0",
 ]
@@ -118,6 +120,13 @@ include = ["omlx*"]
 "omlx" = ["oq_calibration_data.json"]
 "omlx.admin" = ["templates/**/*.html", "static/**/*", "i18n/*.json"]
 "omlx.eval" = ["data/*.jsonl"]
+
+[tool.uv]
+# mlx-lm is pinned to a git commit; override transitive pins
+# (e.g. mlx-audio → mlx-lm==0.31.1) so the resolver accepts it.
+override-dependencies = [
+    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@4469ad4",
+]
 
 [tool.black]
 line-length = 88

@@ -57,6 +57,7 @@ def _make_mock_pool(tts_engine=None, model_id: str = "qwen3-tts") -> MagicMock:
     pool.preload_pinned_models = AsyncMock()
     pool.check_ttl_expirations = AsyncMock()
     pool.shutdown = AsyncMock()
+    pool.resolve_model_id = MagicMock(side_effect=lambda m, _: m)
     return pool
 
 
@@ -240,6 +241,82 @@ class TestTTSEndpointErrors:
             json={"input": "No model specified"},
         )
         assert response.status_code >= 400
+
+
+# ---------------------------------------------------------------------------
+# TestTTSModelAliasResolution
+# ---------------------------------------------------------------------------
+
+
+class TestTTSModelAliasResolution:
+    """Verify that audio endpoints resolve model aliases (#489)."""
+
+    def test_speech_resolves_alias(self):
+        """POST /v1/audio/speech with alias resolves to real model ID."""
+        from omlx.server import app
+
+        _ensure_audio_routes(app)
+
+        mock_pool = _make_mock_pool(model_id="Qwen3-TTS-12Hz-1.7B-Base-bf16")
+        # Configure alias resolution on the pool
+        mock_pool.resolve_model_id = MagicMock(
+            return_value="Qwen3-TTS-12Hz-1.7B-Base-bf16"
+        )
+
+        mock_settings_manager = MagicMock()
+
+        with patch("omlx.server._server_state") as mock_state:
+            mock_state.engine_pool = mock_pool
+            mock_state.global_settings = None
+            mock_state.process_memory_enforcer = None
+            mock_state.hf_downloader = None
+            mock_state.ms_downloader = None
+            mock_state.mcp_manager = None
+            mock_state.api_key = None
+            mock_state.settings_manager = mock_settings_manager
+            with TestClient(app, raise_server_exceptions=False) as client:
+                response = client.post(
+                    "/v1/audio/speech",
+                    json={"model": "qwen3-tts", "input": "Hello"},
+                )
+                assert response.status_code == 200
+                # Verify pool.get_engine was called with the resolved ID
+                mock_pool.get_engine.assert_awaited_once_with(
+                    "Qwen3-TTS-12Hz-1.7B-Base-bf16"
+                )
+
+    def test_speech_direct_model_id(self):
+        """POST /v1/audio/speech with direct model ID works without alias."""
+        from omlx.server import app
+
+        _ensure_audio_routes(app)
+
+        mock_pool = _make_mock_pool(model_id="Qwen3-TTS-12Hz-1.7B-Base-bf16")
+        mock_pool.resolve_model_id = MagicMock(
+            return_value="Qwen3-TTS-12Hz-1.7B-Base-bf16"
+        )
+
+        with patch("omlx.server._server_state") as mock_state:
+            mock_state.engine_pool = mock_pool
+            mock_state.global_settings = None
+            mock_state.process_memory_enforcer = None
+            mock_state.hf_downloader = None
+            mock_state.ms_downloader = None
+            mock_state.mcp_manager = None
+            mock_state.api_key = None
+            mock_state.settings_manager = MagicMock()
+            with TestClient(app, raise_server_exceptions=False) as client:
+                response = client.post(
+                    "/v1/audio/speech",
+                    json={
+                        "model": "Qwen3-TTS-12Hz-1.7B-Base-bf16",
+                        "input": "Hello",
+                    },
+                )
+                assert response.status_code == 200
+                mock_pool.get_engine.assert_awaited_once_with(
+                    "Qwen3-TTS-12Hz-1.7B-Base-bf16"
+                )
 
 
 # ---------------------------------------------------------------------------
